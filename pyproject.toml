@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inference-optimizer"
+version = "0.1.0"
+requires-python = ">=3.10"
+# Dependencies are pinned in requirements.txt.
+# Install with: pip install -r requirements.txt && pip install -e . --no-deps
+
+[tool.setuptools.packages.find]
+# Discover src and all its sub-packages (src.data, src.models, …)
+where = ["."]
+include = ["src*"]

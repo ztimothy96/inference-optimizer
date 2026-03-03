@@ -1,0 +1,19 @@
+{
+  "model_dir": "models/ast_baseline/checkpoint-1512",
+  "n_test": 2874,
+  "accuracy": 0.4071,
+  "mAP": 0.6209,
+  "per_class_AP": {
+    "cel": 0.3311,
+    "cla": 0.3295,
+    "flu": 0.6062,
+    "gac": 0.6541,
+    "gel": 0.6966,
+    "org": 0.4975,
+    "pia": 0.6251,
+    "sax": 0.8827,
+    "tru": 0.5387,
+    "vio": 0.6858,
+    "voi": 0.9828
+  }
+}
