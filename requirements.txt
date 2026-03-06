@@ -20,7 +20,7 @@ httpcore==1.0.9
 httpx==0.28.1
 huggingface_hub==1.4.1
 idna==3.11
--e git+https://github.com/ztimothy96/inference-optimizer.git@a0bbe8a736397045b4f30b5e02a6b82bd9b10e4d#egg=inference_optimizer
+-e git+https://github.com/ztimothy96/inference-optimizer.git@20451b0b747c8f40c602cae12b3ef815155d0c40#egg=inference_optimizer
 Jinja2==3.1.6
 joblib==1.5.3
 markdown-it-py==4.0.0

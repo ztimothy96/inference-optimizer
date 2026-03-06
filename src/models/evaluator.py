@@ -5,9 +5,11 @@ Load a saved AST model and evaluate it on the IRMAS test set.
 
 Outputs
 -------
-- Accuracy (argmax, single-label style)
-- Mean Average Precision (mAP, multi-label fair)
-- Per-class AP breakdown
+- mAP (macro)          — ranking-based, multi-label fair
+- F1 macro / micro     — threshold-based (default 0.5)
+- Hamming loss         — fraction of wrong label slots
+- AUC-ROC macro        — area under ROC, macro-averaged
+- Per-class AP & AUC   — instrument-level breakdown
 - results/baseline_metrics.json
 
 Run from repo root:
@@ -21,8 +23,12 @@ import os
 from pathlib import Path
 
 import numpy as np
-from scipy.special import softmax
-from sklearn.metrics import accuracy_score, average_precision_score
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    hamming_loss,
+    roc_auc_score,
+)
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForAudioClassification
@@ -34,18 +40,17 @@ from src.data.transforms import IRMAStoAST
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_MODEL_DIR = "models/ast_baseline"
-CHECKPOINT        = "MIT/ast-finetuned-audioset-10-10-0.4593"
-RESULTS_PATH      = "results/baseline_metrics.json"
-BATCH_SIZE        = 8
-MAX_LENGTH_S      = 3.0
+CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
+RESULTS_PATH = "results/baseline_metrics.json"
+BATCH_SIZE = 8
+MAX_LENGTH_S = 3.0
+THRESHOLD = 0.5  # sigmoid probability threshold for positive prediction
 
 
 def evaluate(model_dir: str) -> dict:
-    device = (
-        torch.device("mps")  if torch.backends.mps.is_available() else
-        torch.device("cuda") if torch.cuda.is_available() else
-        torch.device("cpu")
-    )
+    device = (torch.device("mps")
+              if torch.backends.mps.is_available() else torch.device("cuda")
+              if torch.cuda.is_available() else torch.device("cpu"))
     print(f"Device: {device}")
 
     # ── Load model ────────────────────────────────────────────────────────────
@@ -66,7 +71,7 @@ def evaluate(model_dir: str) -> dict:
     def collate(samples):
         return {
             "input_values": torch.stack([s["input_values"] for s in samples]),
-            "labels":       torch.stack([s["label"]        for s in samples]),
+            "labels": torch.stack([s["label"] for s in samples]),
         }
 
     loader = DataLoader(test_ds, batch_size=BATCH_SIZE, collate_fn=collate)
@@ -81,42 +86,70 @@ def evaluate(model_dir: str) -> dict:
             all_logits.append(logits.cpu().numpy())
             all_labels.append(batch["labels"].numpy())
 
-    logits = np.concatenate(all_logits, axis=0)   # (N, 11)
-    labels = np.concatenate(all_labels, axis=0)   # (N, 11)  multi-hot
+    logits = np.concatenate(all_logits, axis=0)  # (N, 11)
+    labels = np.concatenate(all_labels, axis=0)  # (N, 11)  multi-hot
 
     # ── Metrics ───────────────────────────────────────────────────────────────
-    probs = softmax(logits, axis=-1)              # (N, 11)
+    # Sigmoid: independent per-class probabilities (BCEWithLogitsLoss model)
+    probs = 1.0 / (1.0 + np.exp(-logits))  # (N, NUM_CLASSES)
+    preds = (probs >= THRESHOLD).astype(int)  # binary predictions
+    labels_int = labels.astype(int)
 
-    # Accuracy — argmax comparison (interpretable, but biased on multi-label)
-    preds = np.argmax(logits, axis=-1)
-    refs  = np.argmax(labels, axis=-1)
-    accuracy = accuracy_score(refs, preds)
+    # mAP — ranking-based, fair for single- and multi-label samples
+    mAP = average_precision_score(labels_int, probs, average="macro")
 
-    # mAP — ranking-based, fair for both single- and multi-label samples
-    mAP = average_precision_score(labels, probs, average="macro")
+    # Per-class AP
+    per_class_ap = average_precision_score(labels_int, probs, average=None)
+    per_class_ap_d = {
+        cls: round(float(ap), 4)
+        for cls, ap in zip(IRMAS_CLASSES, per_class_ap)
+    }
 
-    # Per-class AP (useful for spotting which instruments are hardest)
-    per_class_ap = average_precision_score(labels, probs, average=None)
-    per_class = {cls: round(float(ap), 4)
-                 for cls, ap in zip(IRMAS_CLASSES, per_class_ap)}
+    # F1 — threshold-based
+    f1_macro = f1_score(labels_int, preds, average="macro", zero_division=0)
+    f1_micro = f1_score(labels_int, preds, average="micro", zero_division=0)
+
+    # Hamming loss — fraction of individual label slots predicted incorrectly
+    h_loss = hamming_loss(labels_int, preds)
+
+    # Per-class AUC-ROC
+    try:
+        per_class_auc = roc_auc_score(labels_int, probs, average=None)
+        auc_macro = float(np.mean(per_class_auc))
+    except ValueError:
+        per_class_auc = [float("nan")] * NUM_CLASSES
+        auc_macro = float("nan")
+    per_class_auc_d = {
+        cls: round(float(auc), 4)
+        for cls, auc in zip(IRMAS_CLASSES, per_class_auc)
+    }
 
     results = {
-        "model_dir":   model_dir,
-        "n_test":      len(test_ds),
-        "accuracy":    round(float(accuracy), 4),
-        "mAP":         round(float(mAP), 4),
-        "per_class_AP": per_class,
+        "model_dir": model_dir,
+        "n_test": len(test_ds),
+        "mAP": round(float(mAP), 4),
+        "f1_macro": round(float(f1_macro), 4),
+        "f1_micro": round(float(f1_micro), 4),
+        "hamming": round(float(h_loss), 4),
+        "auc_macro": round(auc_macro, 4),
+        "per_class_AP": per_class_ap_d,
+        "per_class_AUC": per_class_auc_d,
     }
 
     # ── Print ─────────────────────────────────────────────────────────────────
     print(f"\n{'─'*40}")
-    print(f"  Accuracy (argmax) : {accuracy:.4f}")
-    print(f"  mAP (macro)       : {mAP:.4f}")
+    print(f"  mAP   (macro)     : {mAP:.4f}")
+    print(f"  F1    (macro)     : {f1_macro:.4f}")
+    print(f"  F1    (micro)     : {f1_micro:.4f}")
+    print(f"  Hamming loss      : {h_loss:.4f}")
+    print(f"  AUC   (macro)     : {auc_macro:.4f}")
     print(f"{'─'*40}")
-    print("  Per-class AP:")
-    for cls, ap in sorted(per_class.items(), key=lambda x: -x[1]):
+    print("  Per-class AP  /  AUC:")
+    for cls in IRMAS_CLASSES:
+        ap = per_class_ap_d[cls]
+        auc = per_class_auc_d[cls]
         bar = "█" * int(ap * 20)
-        print(f"    {cls:>3}  {ap:.4f}  {bar}")
+        print(f"    {cls:>3}  AP {ap:.4f}  AUC {auc:.4f}  {bar}")
 
     # ── Save ──────────────────────────────────────────────────────────────────
     os.makedirs(Path(RESULTS_PATH).parent, exist_ok=True)
@@ -130,7 +163,8 @@ def evaluate(model_dir: str) -> dict:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model-dir", default=DEFAULT_MODEL_DIR,
+        "--model-dir",
+        default=DEFAULT_MODEL_DIR,
         help="Path to saved model directory (default: models/ast_baseline)",
     )
     args = parser.parse_args()

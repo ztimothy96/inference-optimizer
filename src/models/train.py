@@ -21,7 +21,12 @@ import torch
 from torch.utils.data import random_split
 from dataclasses import dataclass
 from typing import Any, Dict, List
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    hamming_loss,
+    roc_auc_score,
+)
 
 from transformers import (
     AutoModelForAudioClassification,
@@ -82,6 +87,7 @@ model = AutoModelForAudioClassification.from_pretrained(
     id2label=id2label,
     label2id=label2id,
     ignore_mismatched_sizes=True,  # replaces the AudioSet head (527 classes)
+    problem_type="multi_label_classification",  # → BCEWithLogitsLoss
 )
 
 # Freeze all parameters first, then selectively unfreeze.
@@ -132,25 +138,45 @@ class IRMASCollator:
 
 # ── 4. Metrics ────────────────────────────────────────────────────────────────
 
+THRESHOLD = 0.5  # sigmoid probability threshold for positive label prediction
+
 
 def compute_metrics(eval_pred):
+    """
+    Multi-label metrics for instrument recognition.
+
+    eval_pred.predictions : (N, NUM_CLASSES)  raw logits
+    eval_pred.label_ids   : (N, NUM_CLASSES)  multi-hot float32
+    """
     logits, labels = eval_pred
-    preds = np.argmax(logits, axis=-1)  # (N,) — model's top-1 prediction
+    labels_int = labels.astype(int)  # int for sklearn multi-label functions
 
-    # Top-1 hit rate: is the predicted class anywhere in the true label set?
-    # For single-label val clips  → equivalent to standard accuracy.
-    # For multi-label test clips  → correct if the model names ANY true instrument,
-    #                               rather than demanding it guess the lowest index.
-    top1_hits = labels[np.arange(len(preds)), preds] > 0
-    top1_accuracy = top1_hits.mean()
+    probs = 1.0 / (1.0 + np.exp(-logits))  # (N, NUM_CLASSES)
+    preds = (probs >= THRESHOLD).astype(int)  # (N, NUM_CLASSES)
 
-    # F1: compare against the single most-confident true label (for logging).
-    refs = np.argmax(labels, axis=-1)
-    return {
-        "top1_accuracy": float(top1_accuracy),
-        "f1_macro":
-        float(f1_score(refs, preds, average="macro", zero_division=0)),
+    mAP = average_precision_score(labels_int, probs, average="macro")
+    f1_macro = f1_score(labels_int, preds, average="macro", zero_division=0)
+    f1_micro = f1_score(labels_int, preds, average="micro", zero_division=0)
+    h_loss = hamming_loss(labels_int, preds)
+    try:
+        per_class_auc = roc_auc_score(labels_int, probs, average=None)
+        auc_macro = float(np.mean(per_class_auc))
+    except ValueError:
+        per_class_auc = [float("nan")] * NUM_CLASSES
+        auc_macro = float("nan")
+
+    metrics = {
+        "mAP": float(mAP),
+        "f1_macro": float(f1_macro),
+        "f1_micro": float(f1_micro),
+        "hamming": float(h_loss),
+        "auc_macro": auc_macro,
     }
+    # Per-class AUC entries, e.g. "auc_cel", "auc_cla", …
+    for cls, auc in zip(IRMAS_CLASSES, per_class_auc):
+        metrics[f"auc_{cls}"] = float(auc)
+
+    return metrics
 
 
 # ── 5. Train ──────────────────────────────────────────────────────────────────
@@ -167,7 +193,7 @@ training_args = TrainingArguments(
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="top1_accuracy",
+    metric_for_best_model="mAP",
     logging_steps=50,
     fp16=False,  # set True if your hardware supports it
     seed=SEED,
