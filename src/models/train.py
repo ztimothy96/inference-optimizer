@@ -40,10 +40,10 @@ from src.data.transforms import IRMAStoAST
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
-OUTPUT_DIR = "./models/ast_baseline"
+OUTPUT_DIR = "./models/ast_mixup"
 BATCH_SIZE = 4  # small batch to fit in MPS / 16 GB memory
 GRAD_ACCUM_STEPS = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
-EPOCHS = 5
+EPOCHS = 4
 LR = 1e-5
 VAL_FRACTION = 0.1  # share of training clips used for validation
 SEED = 42
@@ -118,21 +118,52 @@ print(f"Trainable params: {trainable:,} / {total:,} "
 
 # ── 3. Data collator ──────────────────────────────────────────────────────────
 
+# Set MIXUP to True to blend adjacent pairs in every batch at equal weight
+# (λ=0.5), or False to disable mixup and fall back to plain collation.
+MIXUP = False
 
-@dataclass
-class IRMASCollator:
-    """
-    Collate a list of IRMASDataset samples into batched tensors.
 
-    Each sample dict has:
-        "input_values": torch.Tensor  (time_frames, mel_bins)
-        "label":        torch.Tensor  (NUM_CLASSES,)  multi-hot float32
+class MixupCollator:
     """
+    Collate a list of IRMASDataset samples into batched tensors, applying
+    audio Mixup to synthesise multilabel training clips on the fly.
+
+    Motivation
+    ----------
+    The IRMAS training set is single-label (each clip is labelled with exactly
+    one predominant instrument), while the test set is multilabel (1–3
+    instruments co-present).  Blending two training clips together creates a
+    synthetic example with both instruments active, closing the train/test
+    distribution gap without any changes to the dataset or model architecture.
+
+    Label strategy
+    --------------
+    Hard binary-OR union: ``labels = clamp(labels_A + labels_B, max=1)``.
+    This is correct for BCEWithLogitsLoss, where each class is an independent
+    binary decision — if an instrument is audible, the model should predict it.
+
+    Parameters
+    ----------
+    mixup : bool
+        Whether to apply mixup.  Set to False to disable.
+    """
+
+    def __init__(self, mixup: bool = MIXUP) -> None:
+        self.mixup = mixup
 
     def __call__(self, samples: List[Dict[str,
                                           Any]]) -> Dict[str, torch.Tensor]:
         input_values = torch.stack([s["input_values"] for s in samples])
         labels = torch.stack([s["label"] for s in samples])
+
+        if self.mixup:
+            # Roll the batch by one position to get a distinct mixing partner
+            # for every sample without fetching extra data.
+            rolled_idx = list(range(1, len(samples))) + [0]
+            input_values = 0.5 * input_values + 0.5 * input_values[rolled_idx]
+            # Hard union: both instruments are present in the blended clip.
+            labels = torch.clamp(labels + labels[rolled_idx], max=1.0)
+
         return {"input_values": input_values, "labels": labels}
 
 
@@ -204,7 +235,7 @@ trainer = Trainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    data_collator=IRMASCollator(),
+    data_collator=MixupCollator(mixup=MIXUP),
     compute_metrics=compute_metrics,
 )
 

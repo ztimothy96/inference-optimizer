@@ -60,8 +60,11 @@ def evaluate(model_dir: str) -> dict:
     model.to(device)
 
     # ── Load test dataset ─────────────────────────────────────────────────────
+    # feature extractor
+    fe_source = model_dir if Path(
+        model_dir, "preprocessor_config.json").exists() else CHECKPOINT
     transform = IRMAStoAST(
-        model_checkpoint=CHECKPOINT,
+        model_checkpoint=fe_source,
         max_length_s=MAX_LENGTH_S,
         padding=True,
     )
