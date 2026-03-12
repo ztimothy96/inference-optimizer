@@ -99,6 +99,7 @@ def run_benchmark(
     n_warmup: int,
     output: Optional[str],
     run_profiler: bool,
+    compile_model: bool = False,
 ) -> dict:
     # ── Device ────────────────────────────────────────────────────────────────
     device = (torch.device("mps")
@@ -113,6 +114,14 @@ def run_benchmark(
     model = AutoModelForAudioClassification.from_pretrained(model_dir)
     model.eval()
     model.to(device)
+
+    if compile_model:
+        if device.type == "cuda":
+            compile_kwargs = {"mode": "reduce-overhead"}
+        else:
+            compile_kwargs = {"backend": "aot_eager"}
+        print(f"Compiling model with torch.compile({compile_kwargs}) …")
+        model = torch.compile(model, **compile_kwargs)
 
     # ── Feature extractor ─────────────────────────────────────────────────────
     fe_source = (model_dir if Path(
@@ -197,6 +206,7 @@ def run_benchmark(
 
     results: dict = {
         "model_dir": model_dir,
+        "compiled": compile_model,
         "device": str(device),
         "n_requests": n_requests,
         "n_warmup": n_warmup,
@@ -266,8 +276,9 @@ def run_benchmark(
 
         # Chrome trace for Perfetto / chrome://tracing
         model_stem = Path(model_dir).stem
-        trace_path = os.path.join(RESULTS_DIR,
-                                  f"profiler_trace_{model_stem}.json")
+        compile_tag = "_compiled" if compile_model else ""
+        trace_path = os.path.join(
+            RESULTS_DIR, f"profiler_trace_{model_stem}{compile_tag}.json")
         os.makedirs(RESULTS_DIR, exist_ok=True)
         prof.export_chrome_trace(trace_path)
         print(f"\nChrome trace saved → '{trace_path}'")
@@ -278,7 +289,9 @@ def run_benchmark(
     # ── Save JSON ─────────────────────────────────────────────────────────────
     if output is None:
         model_stem = Path(model_dir).stem
-        output = os.path.join(RESULTS_DIR, f"latency_{model_stem}.json")
+        compile_tag = "_compiled" if compile_model else ""
+        output = os.path.join(RESULTS_DIR,
+                              f"latency_{model_stem}{compile_tag}.json")
 
     os.makedirs(Path(output).parent, exist_ok=True)
     with open(output, "w") as fh:
@@ -323,6 +336,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip the torch.profiler detailed operator breakdown",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help=
+        "Wrap model with torch.compile(mode='reduce-overhead') after loading",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -331,4 +350,5 @@ if __name__ == "__main__":
         n_warmup=args.n_warmup,
         output=args.output,
         run_profiler=not args.no_profiler,
+        compile_model=args.compile,
     )

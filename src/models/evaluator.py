@@ -41,13 +41,19 @@ from src.data.transforms import IRMAStoAST
 
 DEFAULT_MODEL_DIR = "models/ast_baseline"
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
-RESULTS_PATH = "results/baseline_metrics.json"
+RESULTS_DIR = "results"
 BATCH_SIZE = 8
 MAX_LENGTH_S = 3.0
 THRESHOLD = 0.5  # sigmoid probability threshold for positive prediction
 
 
-def evaluate(model_dir: str) -> dict:
+def _results_path(model_dir: str, compiled: bool) -> str:
+    stem = Path(model_dir).stem
+    suffix = "_compiled" if compiled else ""
+    return str(Path(RESULTS_DIR) / f"{stem}{suffix}_metrics.json")
+
+
+def evaluate(model_dir: str, compile_model: bool = False) -> dict:
     device = (torch.device("mps")
               if torch.backends.mps.is_available() else torch.device("cuda")
               if torch.cuda.is_available() else torch.device("cpu"))
@@ -58,6 +64,14 @@ def evaluate(model_dir: str) -> dict:
     model = AutoModelForAudioClassification.from_pretrained(model_dir)
     model.eval()
     model.to(device)
+
+    if compile_model:
+        if device.type == "cuda":
+            compile_kwargs = {"mode": "reduce-overhead"}
+        else:
+            compile_kwargs = {"backend": "aot_eager"}
+        print(f"Compiling model with torch.compile({compile_kwargs}) …")
+        model = torch.compile(model, **compile_kwargs)
 
     # ── Load test dataset ─────────────────────────────────────────────────────
     # feature extractor
@@ -129,6 +143,7 @@ def evaluate(model_dir: str) -> dict:
 
     results = {
         "model_dir": model_dir,
+        "compiled": compile_model,
         "n_test": len(test_ds),
         "mAP": round(float(mAP), 4),
         "f1_macro": round(float(f1_macro), 4),
@@ -155,20 +170,28 @@ def evaluate(model_dir: str) -> dict:
         print(f"    {cls:>3}  AP {ap:.4f}  AUC {auc:.4f}  {bar}")
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    os.makedirs(Path(RESULTS_PATH).parent, exist_ok=True)
-    with open(RESULTS_PATH, "w") as f:
+    results_path = _results_path(model_dir, compile_model)
+    os.makedirs(Path(results_path).parent, exist_ok=True)
+    with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved to '{RESULTS_PATH}'")
+    print(f"\nResults saved to '{results_path}'")
 
     return results
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter, )
     parser.add_argument(
         "--model-dir",
         default=DEFAULT_MODEL_DIR,
-        help="Path to saved model directory (default: models/ast_baseline)",
+        help="Path to saved model directory",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help=
+        "Wrap model with torch.compile(mode='reduce-overhead') after loading",
     )
     args = parser.parse_args()
-    evaluate(args.model_dir)
+    evaluate(args.model_dir, compile_model=args.compile)
