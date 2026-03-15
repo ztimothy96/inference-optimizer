@@ -31,11 +31,11 @@ from sklearn.metrics import (
 )
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoModelForAudioClassification
 from tqdm import tqdm
 
 from src.data.dataset import IRMASDataset, IRMAS_CLASSES, NUM_CLASSES
 from src.data.transforms import IRMAStoAST
+from src.utils.model_loader import is_onnx_dir, load_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -60,18 +60,24 @@ def evaluate(model_dir: str, compile_model: bool = False) -> dict:
     print(f"Device: {device}")
 
     # ── Load model ────────────────────────────────────────────────────────────
-    print(f"Loading model from '{model_dir}' …")
-    model = AutoModelForAudioClassification.from_pretrained(model_dir)
-    model.eval()
-    model.to(device)
+    _onnx = is_onnx_dir(model_dir)
+    model = load_model(model_dir, device)
 
+    # torch.compile is only applicable to PyTorch nn.Module, not ORT sessions.
+    compile_applied = False
     if compile_model:
-        if device.type == "cuda":
-            compile_kwargs = {"mode": "reduce-overhead"}
+        if _onnx:
+            print(
+                "  Note: torch.compile is not applicable to ONNX models — skipping."
+            )
         else:
-            compile_kwargs = {"backend": "aot_eager"}
-        print(f"Compiling model with torch.compile({compile_kwargs}) …")
-        model = torch.compile(model, **compile_kwargs)
+            if device.type == "cuda":
+                compile_kwargs = {"mode": "reduce-overhead"}
+            else:
+                compile_kwargs = {"backend": "aot_eager"}
+            print(f"Compiling model with torch.compile({compile_kwargs}) …")
+            model = torch.compile(model, **compile_kwargs)
+            compile_applied = True
 
     # ── Load test dataset ─────────────────────────────────────────────────────
     # feature extractor
@@ -143,7 +149,7 @@ def evaluate(model_dir: str, compile_model: bool = False) -> dict:
 
     results = {
         "model_dir": model_dir,
-        "compiled": compile_model,
+        "compiled": compile_applied,
         "n_test": len(test_ds),
         "mAP": round(float(mAP), 4),
         "f1_macro": round(float(f1_macro), 4),
@@ -170,7 +176,7 @@ def evaluate(model_dir: str, compile_model: bool = False) -> dict:
         print(f"    {cls:>3}  AP {ap:.4f}  AUC {auc:.4f}  {bar}")
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    results_path = _results_path(model_dir, compile_model)
+    results_path = _results_path(model_dir, compile_applied)
     os.makedirs(Path(results_path).parent, exist_ok=True)
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)

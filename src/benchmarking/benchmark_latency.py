@@ -44,10 +44,10 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 import torchaudio
-from transformers import AutoModelForAudioClassification
 
 from src.data.dataset import IRMASDataset
 from src.data.transforms import IRMAStoAST
+from src.utils.model_loader import is_onnx_dir, load_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -100,28 +100,38 @@ def run_benchmark(
     output: Optional[str],
     run_profiler: bool,
     compile_model: bool = False,
+    device_override: Optional[str] = None,
 ) -> dict:
     # ── Device ────────────────────────────────────────────────────────────────
-    device = (torch.device("mps")
-              if torch.backends.mps.is_available() else torch.device("cuda")
-              if torch.cuda.is_available() else torch.device("cpu"))
+    if device_override:
+        device = torch.device(device_override)
+    else:
+        device = (torch.device("mps") if torch.backends.mps.is_available() else
+                  torch.device("cuda")
+                  if torch.cuda.is_available() else torch.device("cpu"))
     print(f"Device     : {device}")
     print(f"Model dir  : {model_dir}")
     print(f"Requests   : {n_requests}  (+ {n_warmup} warm-up)")
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    print("\nLoading model …")
-    model = AutoModelForAudioClassification.from_pretrained(model_dir)
-    model.eval()
-    model.to(device)
+    _onnx = is_onnx_dir(model_dir)
+    model = load_model(model_dir, device)
 
+    # torch.compile is only applicable to PyTorch nn.Module, not ORT sessions.
+    compile_applied = False
     if compile_model:
-        if device.type == "cuda":
-            compile_kwargs = {"mode": "reduce-overhead"}
+        if _onnx:
+            print(
+                "  Note: torch.compile is not applicable to ONNX models — skipping."
+            )
         else:
-            compile_kwargs = {"backend": "aot_eager"}
-        print(f"Compiling model with torch.compile({compile_kwargs}) …")
-        model = torch.compile(model, **compile_kwargs)
+            if device.type == "cuda":
+                compile_kwargs = {"mode": "reduce-overhead"}
+            else:
+                compile_kwargs = {"backend": "aot_eager"}
+            print(f"Compiling model with torch.compile({compile_kwargs}) …")
+            model = torch.compile(model, **compile_kwargs)
+            compile_applied = True
 
     # ── Feature extractor ─────────────────────────────────────────────────────
     fe_source = (model_dir if Path(
@@ -206,7 +216,7 @@ def run_benchmark(
 
     results: dict = {
         "model_dir": model_dir,
-        "compiled": compile_model,
+        "compiled": compile_applied,
         "device": str(device),
         "n_requests": n_requests,
         "n_warmup": n_warmup,
@@ -276,7 +286,7 @@ def run_benchmark(
 
         # Chrome trace for Perfetto / chrome://tracing
         model_stem = Path(model_dir).stem
-        compile_tag = "_compiled" if compile_model else ""
+        compile_tag = "_compiled" if compile_applied else ""
         trace_path = os.path.join(
             RESULTS_DIR, f"profiler_trace_{model_stem}{compile_tag}.json")
         os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -289,7 +299,7 @@ def run_benchmark(
     # ── Save JSON ─────────────────────────────────────────────────────────────
     if output is None:
         model_stem = Path(model_dir).stem
-        compile_tag = "_compiled" if compile_model else ""
+        compile_tag = "_compiled" if compile_applied else ""
         output = os.path.join(RESULTS_DIR,
                               f"latency_{model_stem}{compile_tag}.json")
 
@@ -342,6 +352,12 @@ if __name__ == "__main__":
         help=
         "Wrap model with torch.compile(mode='reduce-overhead') after loading",
     )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help=("Force a specific device (e.g. 'cpu', 'cuda', 'mps'). "
+              "Defaults to auto-detection: mps > cuda > cpu."),
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -351,4 +367,5 @@ if __name__ == "__main__":
         output=args.output,
         run_profiler=not args.no_profiler,
         compile_model=args.compile,
+        device_override=args.device,
     )
