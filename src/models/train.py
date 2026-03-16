@@ -1,16 +1,18 @@
 """
 src/models/train.py
 
-Fine-tune the AST model on the IRMAS dataset.
+Fine-tune the AST model on the ESC-50 dataset.
 
 Steps
 -----
-1. Load IRMAS train / test splits via IRMASDataset + IRMAStoAST transform.
-2. Carve a validation split from the training data.
-3. Load the pre-trained AST model, replacing its classification head.
-4. Train with the HuggingFace Trainer.
-5. Evaluate on the held-out test set.
-6. Save the model to OUTPUT_DIR.
+1. Load ESC-50 train (folds 1–4) and test (fold 5) splits via
+   ESC50Dataset + AudioToAST transform.
+2. Load the pre-trained AST model, replacing its classification head
+   for 50 single-label classes.
+3. Train with the HuggingFace Trainer (CrossEntropyLoss via
+   problem_type="single_label_classification").
+4. Evaluate on the held-out test fold.
+5. Save the model to OUTPUT_DIR.
 
 Run from the repo root after `pip install -e .`:
     python -m src.models.train
@@ -18,15 +20,9 @@ Run from the repo root after `pip install -e .`:
 
 import numpy as np
 import torch
-from torch.utils.data import random_split
 from dataclasses import dataclass
 from typing import Any, Dict, List
-from sklearn.metrics import (
-    average_precision_score,
-    f1_score,
-    hamming_loss,
-    roc_auc_score,
-)
+from sklearn.metrics import accuracy_score, f1_score
 
 from transformers import (
     AutoModelForAudioClassification,
@@ -34,20 +30,19 @@ from transformers import (
     Trainer,
 )
 
-from src.data.dataset import IRMASDataset, IRMAS_CLASSES, NUM_CLASSES
-from src.data.transforms import IRMAStoAST
+from src.data.dataset import ESC50Dataset, ESC50_CLASSES, NUM_CLASSES
+from src.data.transforms import AudioToAST
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
-OUTPUT_DIR = "./models/ast_mixup"
+OUTPUT_DIR = "./models/ast_esc50"
 BATCH_SIZE = 4  # small batch to fit in MPS / 16 GB memory
 GRAD_ACCUM_STEPS = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
-EPOCHS = 4
+EPOCHS = 5
 LR = 1e-5
-VAL_FRACTION = 0.1  # share of training clips used for validation
 SEED = 42
-MAX_LENGTH_S = 3.0  # IRMAS training clips are exactly 3 seconds
+MAX_LENGTH_S = 5.0  # ESC-50 clips are exactly 5 seconds
 
 # Unfreeze only the last N transformer layers + classifier to save memory.
 # The AST encoder has 12 layers total; 4 is a good accuracy/memory tradeoff.
@@ -55,30 +50,21 @@ N_UNFREEZE_LAYERS = 4
 
 # ── 1. Transform and Datasets ─────────────────────────────────────────────────
 
-transform = IRMAStoAST(
+transform = AudioToAST(
     model_checkpoint=CHECKPOINT,
     max_length_s=MAX_LENGTH_S,
     padding=True,
 )
 
-full_train = IRMASDataset("data/train", split="train", transform=transform)
-test_ds = IRMASDataset("data/test", split="test", transform=transform)
+# ESC-50 canonical split: folds 1–4 for training, fold 5 for test.
+train_ds = ESC50Dataset("data", folds=[1, 2, 3, 4], transform=transform)
+test_ds = ESC50Dataset("data", folds=[5], transform=transform)
 
-n_val = int(len(full_train) * VAL_FRACTION)
-n_train = len(full_train) - n_val
-train_ds, val_ds = random_split(
-    full_train,
-    [n_train, n_val],
-    generator=torch.Generator().manual_seed(SEED),
-)
-
-print(
-    f"Train: {len(train_ds):,} | Val: {len(val_ds):,} | Test: {len(test_ds):,}"
-)
+print(f"Train: {len(train_ds):,} | Test: {len(test_ds):,}")
 
 # ── 2. Model ──────────────────────────────────────────────────────────────────
 
-id2label = {i: lbl for i, lbl in enumerate(IRMAS_CLASSES)}
+id2label = {i: lbl for i, lbl in enumerate(ESC50_CLASSES)}
 label2id = {lbl: i for i, lbl in id2label.items()}
 
 model = AutoModelForAudioClassification.from_pretrained(
@@ -87,7 +73,7 @@ model = AutoModelForAudioClassification.from_pretrained(
     id2label=id2label,
     label2id=label2id,
     ignore_mismatched_sizes=True,  # replaces the AudioSet head (527 classes)
-    problem_type="multi_label_classification",  # → BCEWithLogitsLoss
+    problem_type="single_label_classification",  # → CrossEntropyLoss
 )
 
 # Freeze all parameters first, then selectively unfreeze.
@@ -118,96 +104,41 @@ print(f"Trainable params: {trainable:,} / {total:,} "
 
 # ── 3. Data collator ──────────────────────────────────────────────────────────
 
-# Set MIXUP to True to blend adjacent pairs in every batch at equal weight
-# (λ=0.5), or False to disable mixup and fall back to plain collation.
-MIXUP = False
 
-
-class MixupCollator:
-    """
-    Collate a list of IRMASDataset samples into batched tensors, applying
-    audio Mixup to synthesise multilabel training clips on the fly.
-
-    Motivation
-    ----------
-    The IRMAS training set is single-label (each clip is labelled with exactly
-    one predominant instrument), while the test set is multilabel (1–3
-    instruments co-present).  Blending two training clips together creates a
-    synthetic example with both instruments active, closing the train/test
-    distribution gap without any changes to the dataset or model architecture.
-
-    Label strategy
-    --------------
-    Hard binary-OR union: ``labels = clamp(labels_A + labels_B, max=1)``.
-    This is correct for BCEWithLogitsLoss, where each class is an independent
-    binary decision — if an instrument is audible, the model should predict it.
-
-    Parameters
-    ----------
-    mixup : bool
-        Whether to apply mixup.  Set to False to disable.
-    """
-
-    def __init__(self, mixup: bool = MIXUP) -> None:
-        self.mixup = mixup
-
-    def __call__(self, samples: List[Dict[str,
-                                          Any]]) -> Dict[str, torch.Tensor]:
-        input_values = torch.stack([s["input_values"] for s in samples])
-        labels = torch.stack([s["label"] for s in samples])
-
-        if self.mixup:
-            # Roll the batch by one position to get a distinct mixing partner
-            # for every sample without fetching extra data.
-            rolled_idx = list(range(1, len(samples))) + [0]
-            input_values = 0.5 * input_values + 0.5 * input_values[rolled_idx]
-            # Hard union: both instruments are present in the blended clip.
-            labels = torch.clamp(labels + labels[rolled_idx], max=1.0)
-
-        return {"input_values": input_values, "labels": labels}
+def collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """Stack input_values and labels into a batch."""
+    return {
+        "input_values": torch.stack([s["input_values"] for s in samples]),
+        "labels": torch.stack([s["label"] for s in samples]),
+    }
 
 
 # ── 4. Metrics ────────────────────────────────────────────────────────────────
 
-THRESHOLD = 0.5  # sigmoid probability threshold for positive label prediction
-
 
 def compute_metrics(eval_pred):
     """
-    Multi-label metrics for instrument recognition.
+    Single-label metrics for environmental sound classification.
 
     eval_pred.predictions : (N, NUM_CLASSES)  raw logits
-    eval_pred.label_ids   : (N, NUM_CLASSES)  multi-hot float32
+    eval_pred.label_ids   : (N,)              integer class indices
     """
     logits, labels = eval_pred
-    labels_int = labels.astype(int)  # int for sklearn multi-label functions
+    preds = np.argmax(logits, axis=1)
+    labels_int = labels.astype(int)
 
-    probs = 1.0 / (1.0 + np.exp(-logits))  # (N, NUM_CLASSES)
-    preds = (probs >= THRESHOLD).astype(int)  # (N, NUM_CLASSES)
-
-    mAP = average_precision_score(labels_int, probs, average="macro")
+    accuracy = accuracy_score(labels_int, preds)
     f1_macro = f1_score(labels_int, preds, average="macro", zero_division=0)
-    f1_micro = f1_score(labels_int, preds, average="micro", zero_division=0)
-    h_loss = hamming_loss(labels_int, preds)
-    try:
-        per_class_auc = roc_auc_score(labels_int, probs, average=None)
-        auc_macro = float(np.mean(per_class_auc))
-    except ValueError:
-        per_class_auc = [float("nan")] * NUM_CLASSES
-        auc_macro = float("nan")
+    f1_weighted = f1_score(labels_int,
+                           preds,
+                           average="weighted",
+                           zero_division=0)
 
-    metrics = {
-        "mAP": float(mAP),
+    return {
+        "accuracy": float(accuracy),
         "f1_macro": float(f1_macro),
-        "f1_micro": float(f1_micro),
-        "hamming": float(h_loss),
-        "auc_macro": auc_macro,
+        "f1_weighted": float(f1_weighted),
     }
-    # Per-class AUC entries, e.g. "auc_cel", "auc_cla", …
-    for cls, auc in zip(IRMAS_CLASSES, per_class_auc):
-        metrics[f"auc_{cls}"] = float(auc)
-
-    return metrics
 
 
 # ── 5. Train ──────────────────────────────────────────────────────────────────
@@ -217,14 +148,14 @@ training_args = TrainingArguments(
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=GRAD_ACCUM_STEPS,  # effective batch = 4 * 4 = 16
+    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
     learning_rate=LR,
     warmup_ratio=0.06,
     weight_decay=0.01,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
-    metric_for_best_model="mAP",
+    metric_for_best_model="accuracy",
     logging_steps=50,
     fp16=False,  # set True if your hardware supports it
     seed=SEED,
@@ -234,8 +165,8 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
-    eval_dataset=val_ds,
-    data_collator=MixupCollator(mixup=MIXUP),
+    eval_dataset=test_ds,
+    data_collator=collate_fn,
     compute_metrics=compute_metrics,
 )
 

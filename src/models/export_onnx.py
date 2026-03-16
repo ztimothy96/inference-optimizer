@@ -12,12 +12,12 @@ and returns:
 Usage
 -----
     python -m src.models.export_onnx
-    python -m src.models.export_onnx --model-dir models/ast_baseline \\
-                                     --output-dir models/ast_baseline_onnx
+    python -m src.models.export_onnx --model-dir models/ast_esc50 \\
+                                     --output-dir models/ast_esc50_onnx
 
 CLI flags
 ---------
-  --model-dir   Path to saved HF model directory  (default: models/ast_baseline)
+  --model-dir   Path to saved HF model directory  (default: models/ast_esc50)
   --output-dir  Directory for model.onnx output   (default: models/ast_onnx)
 """
 
@@ -33,11 +33,11 @@ from src.data.transforms import TARGET_SR
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL_DIR = "models/ast_baseline"
+DEFAULT_MODEL_DIR = "models/ast_esc50"
 DEFAULT_OUTPUT_DIR = "models/ast_onnx"
 DEFAULT_CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
-MAX_LENGTH_S = 3.0  # must match the value used during training / evaluation
+MAX_LENGTH_S = 5.0  # must match the value used during training / evaluation
 OPSET_VERSION = 17  # ONNX opset 17 is the minimum recommended for Transformers
 
 # ── Wrapper ───────────────────────────────────────────────────────────────────

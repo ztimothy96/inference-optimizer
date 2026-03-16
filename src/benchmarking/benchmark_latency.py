@@ -8,7 +8,7 @@ inference, simulating a real serving scenario:
 
   1. Audio loading    – torchaudio.load()
   2. Preprocessing   – resample + mono downmix + log-mel extraction
-                       (IRMAStoAST / ASTFeatureExtractor)
+                       (AudioToAST / ASTFeatureExtractor)
   3. Model inference – forward pass through the AST model
 
 Additionally runs torch.profiler on the model forward pass for a detailed
@@ -22,7 +22,7 @@ Statistics reported per stage
 Usage
 -----
     python -m src.benchmarking.benchmark_latency
-    python -m src.benchmarking.benchmark_latency --model-dir models/ast_mixup
+    python -m src.benchmarking.benchmark_latency --model-dir models/ast_esc50
     python -m src.benchmarking.benchmark_latency --n-requests 200 --no-profiler
 
 CLI flags
@@ -45,16 +45,16 @@ import numpy as np
 import torch
 import torchaudio
 
-from src.data.dataset import IRMASDataset
-from src.data.transforms import IRMAStoAST
+from src.data.dataset import ESC50Dataset
+from src.data.transforms import AudioToAST
 from src.utils.model_loader import is_onnx_dir, load_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL_DIR = "models/ast_baseline"
+DEFAULT_MODEL_DIR = "models/ast_esc50"
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
-DATA_ROOT = "data/test"
-MAX_LENGTH_S = 3.0
+DATA_ROOT = "data"
+MAX_LENGTH_S = 5.0
 RESULTS_DIR = "results"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -136,14 +136,15 @@ def run_benchmark(
     # ── Feature extractor ─────────────────────────────────────────────────────
     fe_source = (model_dir if Path(
         model_dir, "preprocessor_config.json").exists() else CHECKPOINT)
-    transform = IRMAStoAST(
+    transform = AudioToAST(
         model_checkpoint=fe_source,
         max_length_s=MAX_LENGTH_S,
         padding=True,
     )
 
     # ── Audio file paths (raw dataset, no transform) ──────────────────────────
-    raw_ds = IRMASDataset(DATA_ROOT, split="test", transform=None)
+    # Use fold 5 (the canonical test fold) for benchmarking.
+    raw_ds = ESC50Dataset(DATA_ROOT, folds=[5], transform=None)
     samples = raw_ds._samples  # List[Tuple[Path, Tensor]]
     n_clips = len(samples)
     print(f"Test clips : {n_clips:,}\n")

@@ -1,233 +1,195 @@
 """
 src/data/dataset.py
 
-PyTorch Dataset for the IRMAS dataset (Instrument Recognition in Musical
-Audio Signals).
+PyTorch Dataset for the ESC-50 dataset (Environmental Sound Classification).
 
 Repo data layout
 ----------------
 data/
-├── train/                   ← split="train" root
-│   ├── cel/                 ← one sub-directory per instrument class
-│   │   ├── [cel][cla]0001__1.wav
-│   │   └── ...
-│   ├── cla/
-│   └── ...  (flu, gac, gel, org, pia, sax, tru, vio, voi)
-│
-└── test/                    ← split="test" root  (flat directory)
-    ├── <song_name>-<n>.wav
-    ├── <song_name>-<n>.txt  ← one instrument label per line (tab-stripped)
-    └── ...
+├── audio/                   ← 2 000 .wav files (44.1 kHz, 5 s)
+│   ├── 1-100032-A-0.wav
+│   └── ...
+└── meta/
+    └── esc50.csv            ← filename, fold, target, category, ...
 
 Each Dataset item is a dict:
     {
         "waveform":    torch.Tensor  shape (channels, samples),
         "sample_rate": int,
-        "label":       torch.Tensor  shape (NUM_CLASSES,)  — multi-hot
+        "label":       torch.Tensor  scalar long  — class index 0–49
         "path":        str           — absolute path to the .wav file
     }
+
+Download
+--------
+    git clone https://github.com/karoldvl/ESC-50.git data/ESC-50
+    # Then point root="data/ESC-50" or symlink data/audio and data/meta.
+
+Fold convention
+---------------
+ESC-50 defines 5 standard folds.  The canonical evaluation protocol holds
+out fold 5 as the test set and trains on folds 1–4.
+
+    train_ds = ESC50Dataset("data", folds=[1, 2, 3, 4])
+    test_ds  = ESC50Dataset("data", folds=[5])
 """
 
 from __future__ import annotations
 
-import os
+import csv
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torchaudio
 from torch.utils.data import Dataset
 
 # ── Label vocabulary ──────────────────────────────────────────────────────────
+# 50 categories in target-index order (0–49).  Matches the 'target' column of
+# esc50.csv exactly; do not reorder.
 
-IRMAS_CLASSES: List[str] = [
-    "cel",  # cello
-    "cla",  # clarinet
-    "flu",  # flute
-    "gac",  # acoustic guitar
-    "gel",  # electric guitar
-    "org",  # organ
-    "pia",  # piano
-    "sax",  # saxophone
-    "tru",  # trumpet
-    "vio",  # violin
-    "voi",  # voice (singing)
+ESC50_CLASSES: List[str] = [
+    # Animals (0–9)
+    "dog",
+    "rooster",
+    "pig",
+    "cow",
+    "frog",
+    "cat",
+    "hen",
+    "insects",
+    "sheep",
+    "crow",
+    # Natural soundscapes & water (10–19)
+    "rain",
+    "sea_waves",
+    "crackling_fire",
+    "crickets",
+    "chirping_birds",
+    "water_drops",
+    "wind",
+    "pouring_water",
+    "toilet_flush",
+    "thunderstorm",
+    # Human, non-speech sounds (20–29)
+    "crying_baby",
+    "sneezing",
+    "clapping",
+    "breathing",
+    "coughing",
+    "footsteps",
+    "laughing",
+    "brushing_teeth",
+    "snoring",
+    "drinking_sipping",
+    # Interior/domestic sounds (30–39)
+    "door_wood_knock",
+    "mouse_click",
+    "keyboard_typing",
+    "door_wood_creaks",
+    "can_opening",
+    "washing_machine",
+    "vacuum_cleaner",
+    "clock_alarm",
+    "clock_tick",
+    "glass_breaking",
+    # Exterior/urban noises (40–49)
+    "helicopter",
+    "chainsaw",
+    "siren",
+    "car_horn",
+    "engine",
+    "train",
+    "church_bells",
+    "airplane",
+    "fireworks",
+    "hand_saw",
 ]
 
-LABEL2IDX: Dict[str, int] = {lbl: idx for idx, lbl in enumerate(IRMAS_CLASSES)}
+LABEL2IDX: Dict[str, int] = {lbl: idx for idx, lbl in enumerate(ESC50_CLASSES)}
 IDX2LABEL: Dict[int, str] = {idx: lbl for lbl, idx in LABEL2IDX.items()}
-NUM_CLASSES: int = len(IRMAS_CLASSES)
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def _labels_to_multihot(labels: Sequence[str]) -> torch.Tensor:
-    """Convert a list of instrument label strings to a multi-hot tensor."""
-    vec = torch.zeros(NUM_CLASSES, dtype=torch.float32)
-    for lbl in labels:
-        lbl = lbl.strip().lower()
-        if lbl in LABEL2IDX:
-            vec[LABEL2IDX[lbl]] = 1.0
-        else:
-            raise ValueError(
-                f"Unknown IRMAS label '{lbl}'. Expected one of {IRMAS_CLASSES}."
-            )
-    return vec
-
-
-def _parse_train_path(wav_path: Path) -> str:
-    """
-    Infer the instrument label from the parent directory name.
-
-    Training clips live in   <root>/<instrument>/<filename>.wav
-    so the immediate parent directory IS the label.
-    """
-    return wav_path.parent.name.lower()
-
-
-def _parse_test_annotation(txt_path: Path) -> List[str]:
-    """
-    Read labels from a test-set annotation .txt file.
-
-    Each non-empty line contains one instrument abbreviation, e.g.:
-        cel
-        vio
-    """
-    labels: List[str] = []
-    with open(txt_path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                labels.append(line)
-    if not labels:
-        raise ValueError(f"No labels found in annotation file: {txt_path}")
-    return labels
-
+NUM_CLASSES: int = len(ESC50_CLASSES)  # 50
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 
-class IRMASDataset(Dataset):
+class ESC50Dataset(Dataset):
     """
-    PyTorch Dataset for IRMAS audio clips.
+    PyTorch Dataset for ESC-50 audio clips.
 
     Parameters
     ----------
     root : str | Path
-        Root directory.
-        - For split="train" pass ``data/train/`` (contains one sub-dir per
-          instrument class).
-        - For split="test"  pass ``data/test/``  (flat directory of .wav /
-          .txt pairs).
-    split : {"train", "test"}
-        Which portion of the dataset to load.
+        Root directory containing ``audio/`` and ``meta/esc50.csv``.
+        Pass the path to your ESC-50 clone, e.g. ``"data"``.
+    folds : list[int]
+        Which ESC-50 folds to include (1–5).  Use ``[1,2,3,4]`` for training
+        and ``[5]`` for the held-out test set.
     transform : callable, optional
-        A callable applied to each raw sample dict before it is returned.
+        Applied to each raw sample dict before it is returned.
         Signature: ``transform(sample: dict) -> dict``.
-        Use ``IRMAStoAST`` from ``src.data.transforms`` here.
+        Use ``AudioToAST`` from ``src.data.transforms`` here.
     max_clips : int, optional
-        If set, only the first *max_clips* examples are kept (useful for
-        quick smoke-tests).
+        Cap the dataset at *max_clips* examples (handy for smoke-tests).
     """
 
     def __init__(
         self,
         root: Union[str, Path],
-        split: str = "train",
+        folds: Optional[List[int]] = None,
         transform: Optional[Callable] = None,
         max_clips: Optional[int] = None,
     ) -> None:
         super().__init__()
-        if split not in ("train", "test"):
-            raise ValueError(
-                f"split must be 'train' or 'test', got '{split}'.")
-
         self.root = Path(root).expanduser().resolve()
-        self.split = split
+        self.folds = set(folds) if folds is not None else {1, 2, 3, 4, 5}
         self.transform = transform
 
         # List of (wav_path, label_tensor) tuples
         self._samples: List[Tuple[Path, torch.Tensor]] = []
-
-        if split == "train":
-            self._index_train()
-        else:
-            self._index_test()
+        self._index()
 
         if max_clips is not None:
             self._samples = self._samples[:max_clips]
 
     # ── Indexing ──────────────────────────────────────────────────────────────
 
-    def _index_train(self) -> None:
-        """
-        Walk each per-instrument sub-directory and collect .wav files.
-        Expected layout: data/train/<instrument>/*.wav
-        """
-        if not self.root.is_dir():
-            raise FileNotFoundError(
-                f"Training root not found: {self.root}\n"
-                "Expected layout: data/train/<instrument>/*.wav")
+    def _index(self) -> None:
+        """Parse esc50.csv and collect clips belonging to the requested folds."""
+        csv_path = self.root / "meta" / "esc50.csv"
+        audio_dir = self.root / "audio"
 
-        found_classes: List[str] = []
-        for class_dir in sorted(self.root.iterdir()):
-            if not class_dir.is_dir():
-                continue
-            class_name = class_dir.name.lower()
-            if class_name not in LABEL2IDX:
-                # Skip non-instrument directories (e.g. __MACOSX)
-                continue
-            found_classes.append(class_name)
-            label_tensor = _labels_to_multihot([class_name])
-            for wav_file in sorted(class_dir.glob("*.wav")):
-                self._samples.append((wav_file, label_tensor))
+        if not csv_path.exists():
+            raise FileNotFoundError(
+                f"Metadata file not found: {csv_path}\n"
+                "Expected layout:  <root>/meta/esc50.csv\n"
+                "Download ESC-50:  git clone https://github.com/karoldvl/ESC-50.git"
+            )
+        if not audio_dir.is_dir():
+            raise FileNotFoundError(
+                f"Audio directory not found: {audio_dir}\n"
+                "Expected layout:  <root>/audio/<filename>.wav")
+
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                fold = int(row["fold"])
+                if fold not in self.folds:
+                    continue
+                target = int(row["target"])
+                filename = row["filename"]
+                wav_path = audio_dir / filename
+                if not wav_path.exists():
+                    import warnings
+                    warnings.warn(f"Audio file missing: {wav_path}",
+                                  stacklevel=2)
+                    continue
+                label = torch.tensor(target, dtype=torch.long)
+                self._samples.append((wav_path, label))
 
         if not self._samples:
             raise RuntimeError(
-                f"No .wav files found under {self.root}. "
-                f"Expected sub-directories named after IRMAS classes: {IRMAS_CLASSES}"
-            )
-
-    def _index_test(self) -> None:
-        """
-        Collect (wav, txt) pairs from the flat data/test/ directory.
-        Every .wav file must have a sibling .txt annotation file whose
-        lines each contain one instrument abbreviation (tab-stripped).
-        Expected layout: data/test/<song_name>-<n>.{wav,txt}
-        """
-        if not self.root.is_dir():
-            raise FileNotFoundError(
-                f"Test root not found: {self.root}\n"
-                "Expected layout: data/test/<song_name>-<n>.wav (flat directory)"
-            )
-
-        wav_files = sorted(self.root.glob("*.wav"))
-        if not wav_files:
-            raise RuntimeError(f"No .wav files found under {self.root}.")
-
-        missing_annotations: List[str] = []
-        for wav_path in wav_files:
-            txt_path = wav_path.with_suffix(".txt")
-            if not txt_path.exists():
-                missing_annotations.append(str(wav_path))
-                continue
-            labels = _parse_test_annotation(txt_path)
-            label_tensor = _labels_to_multihot(labels)
-            self._samples.append((wav_path, label_tensor))
-
-        if missing_annotations:
-            import warnings
-            warnings.warn(
-                f"{len(missing_annotations)} .wav file(s) skipped because no "
-                f"matching .txt annotation was found. First few:\n" +
-                "\n".join(missing_annotations[:5]),
-                stacklevel=2,
-            )
-
-        if not self._samples:
-            raise RuntimeError(
-                "No valid (wav + txt) pairs found. "
-                "Check that annotation .txt files exist alongside the .wav files."
+                f"No clips found for folds {sorted(self.folds)} in {csv_path}."
             )
 
     # ── Dataset protocol ──────────────────────────────────────────────────────
@@ -243,7 +205,7 @@ class IRMASDataset(Dataset):
         sample = {
             "waveform": waveform,  # (C, T)
             "sample_rate": sample_rate,
-            "label": label,  # (NUM_CLASSES,) multi-hot
+            "label": label,  # scalar long — class index 0–49
             "path": str(wav_path),
         }
 
@@ -255,16 +217,14 @@ class IRMASDataset(Dataset):
     # ── Convenience ───────────────────────────────────────────────────────────
 
     def class_counts(self) -> Dict[str, int]:
-        """Return a dict mapping instrument name → number of clips."""
-        counts: Dict[str, int] = {cls: 0 for cls in IRMAS_CLASSES}
+        """Return a dict mapping category name → number of clips."""
+        counts: Dict[str, int] = {cls: 0 for cls in ESC50_CLASSES}
         for _, label in self._samples:
-            for idx, val in enumerate(label):
-                if val == 1.0:
-                    counts[IDX2LABEL[idx]] += 1
+            counts[IDX2LABEL[int(label.item())]] += 1
         return counts
 
     def __repr__(self) -> str:
-        return (f"IRMASDataset(split='{self.split}', "
-                f"root='{self.root}', "
+        return (f"ESC50Dataset(root='{self.root}', "
+                f"folds={sorted(self.folds)}, "
                 f"n_samples={len(self)}, "
                 f"n_classes={NUM_CLASSES})")

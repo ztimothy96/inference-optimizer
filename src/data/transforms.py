@@ -1,19 +1,19 @@
 """
 src/data/transforms.py
 
-Transform that converts a raw IRMAS sample dict (as returned by IRMASDataset)
+Transform that converts a raw ESC-50 sample dict (as returned by ESC50Dataset)
 into the tensor format expected by the AST (Audio Spectrogram Transformer)
 model from Hugging Face.
 
 Typical usage
 -------------
->>> from src.data.dataset import IRMASDataset
->>> from src.data.transforms import IRMAStoAST
+>>> from src.data.dataset import ESC50Dataset
+>>> from src.data.transforms import AudioToAST
 >>>
->>> transform = IRMAStoAST()
->>> ds = IRMASDataset("data/train", split="train", transform=transform)
+>>> transform = AudioToAST()
+>>> ds = ESC50Dataset("data", folds=[1, 2, 3, 4], transform=transform)
 >>> sample = ds[0]
->>> sample["input_values"].shape   # (1024, 128) — log-mel spectrogram patch
+>>> sample["input_values"].shape   # (512, 128) — log-mel spectrogram patch
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ TARGET_SR: int = 16_000
 DEFAULT_CHECKPOINT: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
 
-class IRMAStoAST:
+class AudioToAST:
     """
     Callable transform: raw waveform → AST ``input_values`` tensor.
 
@@ -40,9 +40,9 @@ class IRMAStoAST:
         2. **Downmix** to mono (mean across channels).
         3. **Feature extraction** via ``ASTFeatureExtractor`` — produces a
            log-mel spectrogram of shape ``(time_frames, mel_bins)``,
-           e.g. ``(1024, 128)`` for a 10-second clip.
+           e.g. ``(512, 128)`` for a 5-second clip.
 
-    The transform is designed to be passed to ``IRMASDataset(transform=...)``.
+    The transform is designed to be passed to ``ESC50Dataset(transform=...)``.
     It receives and returns a sample ``dict``, augmenting it with the
     ``"input_values"`` key while keeping ``"label"`` and ``"path"`` intact.
 
@@ -52,8 +52,7 @@ class IRMAStoAST:
         Hugging Face model ID or local path used to load ``ASTFeatureExtractor``.
     max_length_s : float
         Maximum clip duration in **seconds** used when padding/truncating.
-        IRMAS training clips are exactly 3 s; the feature extractor's internal
-        default is 10 s (AudioSet).  Set to 3.0 for tighter, faster training.
+        ESC-50 clips are exactly 5 s; this default matches that duration.
     padding : bool
         Whether to zero-pad clips shorter than ``max_length_s``.
         Keep ``True`` so all tensors in a batch share the same shape.
@@ -66,7 +65,7 @@ class IRMAStoAST:
     def __init__(
         self,
         model_checkpoint: str = DEFAULT_CHECKPOINT,
-        max_length_s: float = 3.0,
+        max_length_s: float = 5.0,
         padding: bool = True,
         return_numpy: bool = False,
     ) -> None:
@@ -90,7 +89,7 @@ class IRMAStoAST:
     def _preprocess_waveform(self, waveform: torch.Tensor,
                              sample_rate: int) -> torch.Tensor:
         """
-        Return a 1-D float32 numpy array at TARGET_SR, ready for the
+        Return a 1-D float32 tensor at TARGET_SR, ready for the
         feature extractor.
 
         Parameters
@@ -120,7 +119,7 @@ class IRMAStoAST:
 
     def __call__(self, sample: Dict) -> Dict:
         """
-        Transform a raw sample dict from ``IRMASDataset``.
+        Transform a raw sample dict from ``ESC50Dataset``.
 
         Parameters
         ----------
@@ -133,7 +132,7 @@ class IRMAStoAST:
         dict
             Same keys as the input, plus ``"input_values"`` containing
             the log-mel spectrogram as a ``torch.Tensor`` of shape
-            ``(time_frames, mel_bins)``, e.g. ``(128, 128)`` for 3-second
+            ``(time_frames, mel_bins)``, e.g. ``(512, 128)`` for 5-second
             clips at 16 kHz.
         """
         waveform: torch.Tensor = sample["waveform"]
@@ -168,7 +167,7 @@ class IRMAStoAST:
         return out
 
     def __repr__(self) -> str:
-        return (f"IRMAStoAST("
+        return (f"AudioToAST("
                 f"checkpoint='{self.feature_extractor.name_or_path}', "
                 f"max_length_s={self.max_length_s}, "
                 f"target_sr={TARGET_SR})")
