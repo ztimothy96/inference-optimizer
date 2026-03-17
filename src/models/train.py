@@ -40,13 +40,14 @@ OUTPUT_DIR = "./models/ast_esc50"
 BATCH_SIZE = 4  # small batch to fit in MPS / 16 GB memory
 GRAD_ACCUM_STEPS = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
 EPOCHS = 5
-LR = 1e-5
+LR = 3e-5
 SEED = 42
 MAX_LENGTH_S = 5.0  # ESC-50 clips are exactly 5 seconds
 
 # Unfreeze only the last N transformer layers + classifier to save memory.
 # The AST encoder has 12 layers total; 4 is a good accuracy/memory tradeoff.
-N_UNFREEZE_LAYERS = 4
+# Increasing to 8 to improve accuracy.
+N_UNFREEZE_LAYERS = 8
 
 # ── 1. Transform and Datasets ─────────────────────────────────────────────────
 
@@ -171,7 +172,7 @@ trainer = Trainer(
 )
 
 print("Starting fine-tuning …")
-trainer.train()
+trainer.train(resume_from_checkpoint=True)
 
 # ── 6. Evaluate, Save ──────────────────────────────────────────────────────────
 
