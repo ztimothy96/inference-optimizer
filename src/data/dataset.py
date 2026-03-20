@@ -40,8 +40,8 @@ import csv
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import soundfile as sf
 import torch
-import torchaudio
 from torch.utils.data import Dataset
 
 # ── Label vocabulary ──────────────────────────────────────────────────────────
@@ -200,7 +200,8 @@ class ESC50Dataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         wav_path, label = self._samples[idx]
 
-        waveform, sample_rate = torchaudio.load(str(wav_path))
+        data, sample_rate = sf.read(str(wav_path), always_2d=True)
+        waveform = torch.from_numpy(data.T).float()  # (channels, samples)
 
         sample = {
             "waveform": waveform,  # (C, T)

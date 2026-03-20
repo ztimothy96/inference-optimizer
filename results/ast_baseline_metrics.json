@@ -1,5 +1,5 @@
 {
-  "model_dir": "models/ast_esc50",
+  "model_dir": "models/ast_baseline",
   "compiled": false,
   "n_test": 400,
   "accuracy": 0.94,

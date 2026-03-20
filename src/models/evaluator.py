@@ -12,7 +12,7 @@ Outputs
 
 Run from repo root:
     python -m src.models.evaluator
-    python -m src.models.evaluator --model-dir models/ast_esc50
+    python -m src.models.evaluator --model-dir models/ast_baseline
 """
 
 import argparse
@@ -32,7 +32,7 @@ from src.utils.model_loader import is_onnx_dir, load_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL_DIR = "models/ast_esc50"
+DEFAULT_MODEL_DIR = "models/ast_baseline"
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
 RESULTS_DIR = "results"
 BATCH_SIZE = 8

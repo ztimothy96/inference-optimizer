@@ -36,7 +36,7 @@ from src.data.transforms import AudioToAST
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
-OUTPUT_DIR = "./models/ast_esc50"
+OUTPUT_DIR = "./models/ast_baseline"
 BATCH_SIZE = 4  # small batch to fit in MPS / 16 GB memory
 GRAD_ACCUM_STEPS = 4  # effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS = 16
 EPOCHS = 5

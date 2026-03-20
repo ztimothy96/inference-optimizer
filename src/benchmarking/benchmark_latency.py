@@ -22,7 +22,7 @@ Statistics reported per stage
 Usage
 -----
     python -m src.benchmarking.benchmark_latency
-    python -m src.benchmarking.benchmark_latency --model-dir models/ast_esc50
+    python -m src.benchmarking.benchmark_latency --model-dir models/ast_baseline
     python -m src.benchmarking.benchmark_latency --n-requests 200 --no-profiler
 
 CLI flags
@@ -42,8 +42,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import soundfile as sf
 import torch
-import torchaudio
 
 from src.data.dataset import ESC50Dataset
 from src.data.transforms import AudioToAST
@@ -51,7 +51,7 @@ from src.utils.model_loader import is_onnx_dir, load_model
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL_DIR = "models/ast_esc50"
+DEFAULT_MODEL_DIR = "models/ast_baseline"
 CHECKPOINT = "MIT/ast-finetuned-audioset-10-10-0.4593"
 DATA_ROOT = "data"
 MAX_LENGTH_S = 5.0
@@ -154,7 +154,8 @@ def run_benchmark(
     with torch.no_grad():
         for i in range(n_warmup):
             wav_path, label = samples[i % n_clips]
-            waveform, sample_rate = torchaudio.load(str(wav_path))
+            data, sample_rate = sf.read(str(wav_path), always_2d=True)
+            waveform = torch.from_numpy(data.T).float()  # (channels, samples)
             sample = {
                 "waveform": waveform,
                 "sample_rate": sample_rate,
@@ -181,7 +182,8 @@ def run_benchmark(
 
             # ── Stage 1 : Audio loading ────────────────────────────────────
             t0 = time.perf_counter()
-            waveform, sample_rate = torchaudio.load(path_str)
+            data, sample_rate = sf.read(path_str, always_2d=True)
+            waveform = torch.from_numpy(data.T).float()  # (channels, samples)
             t1 = time.perf_counter()
             t_load.append((t1 - t0) * 1_000)
 
@@ -250,7 +252,8 @@ def run_benchmark(
 
         # Prepare one input (reuse already-warmed-up transform)
         wav_path, label = samples[0]
-        waveform, sample_rate = torchaudio.load(str(wav_path))
+        data, sample_rate = sf.read(str(wav_path), always_2d=True)
+        waveform = torch.from_numpy(data.T).float()  # (channels, samples)
         raw_sample = {
             "waveform": waveform,
             "sample_rate": sample_rate,
