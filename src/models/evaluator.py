@@ -26,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.dataset import ESC50Dataset, ESC50_CLASSES, NUM_CLASSES
+from src.data.dataset import ESC50Dataset, ESC50_CLASSES
 from src.data.transforms import AudioToAST
 from src.utils.model_loader import is_onnx_dir, load_model
 

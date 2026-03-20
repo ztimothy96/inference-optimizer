@@ -38,13 +38,15 @@ stable and well-tested.
 """
 
 from __future__ import annotations
-
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Union
 
+from optimum.quanto import requantize
+from safetensors.torch import load_file
 import torch
-from transformers import AutoModelForAudioClassification
+from transformers import AutoConfig, AutoModelForAudioClassification
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +54,47 @@ from transformers import AutoModelForAudioClassification
 def is_onnx_dir(model_dir: str) -> bool:
     """Return True if *model_dir* contains a ``model.onnx`` file."""
     return (Path(model_dir) / "model.onnx").exists()
+
+
+def _is_quanto_dir(model_dir: str) -> bool:
+    """Return True if *model_dir* is an optimum.quanto-quantized checkpoint."""
+    return (Path(model_dir) / "quantization_map.json").exists()
+
+
+def _load_quanto_model(
+    model_dir: str,
+    device: torch.device,
+) -> torch.nn.Module:
+
+    model_path = Path(model_dir)
+    print(f"Loading optimum.quanto INT8 model from '{model_dir}' …")
+
+    # Build the model architecture from config alone (no weights).
+    config = AutoConfig.from_pretrained(model_dir)
+    model = AutoModelForAudioClassification.from_config(config)
+
+    # Load the raw quantized state dict from ``model.safetensors``.
+    safetensors_path = model_path / "model.safetensors"
+    pytorch_bin_path = model_path / "pytorch_model.bin"
+    if safetensors_path.exists():
+        state_dict = load_file(str(safetensors_path), device="cpu")
+    elif pytorch_bin_path.exists():
+        state_dict = torch.load(str(pytorch_bin_path),
+                                map_location="cpu",
+                                weights_only=True)
+    else:
+        raise FileNotFoundError(
+            f"No model weights file found in {model_dir}. "
+            "Expected model.safetensors or pytorch_model.bin.")
+
+    # Rebuild quanto module structure and load quantized weights.
+    qmap_path = model_path / "quantization_map.json"
+    with open(qmap_path) as fh:
+        qmap = json.load(fh)
+
+    requantize(model, state_dict, qmap, device=device)
+    model.eval()
+    return model
 
 
 # ── ONNX wrapper ──────────────────────────────────────────────────────────────
@@ -102,6 +145,8 @@ def load_model(
 
     - If ``model_dir/model.onnx`` exists → returns an ``OnnxModelWrapper``
       backed by an ORT InferenceSession.
+    - Else if ``model_dir/quantization_map.json`` exists → returns a ``torch.nn.Module``
+      with optimum.quanto quantized weights.
     - Otherwise → loads with ``AutoModelForAudioClassification``, calls
       ``eval()`` and ``to(device)``, and returns the nn.Module.
 
@@ -145,6 +190,9 @@ def load_model(
         print(f"  ORT providers : {providers}")
         session = ort.InferenceSession(onnx_path, providers=providers)
         return OnnxModelWrapper(session)
+
+    elif _is_quanto_dir(model_dir):
+        return _load_quanto_model(model_dir, device)
 
     else:
         print(f"Loading PyTorch model from '{model_dir}' …")

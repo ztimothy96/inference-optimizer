@@ -84,6 +84,7 @@ def export_to_onnx(model_dir: str, output_dir: str) -> str:
     model = AutoModelForAudioClassification.from_pretrained(model_dir)
     model.eval()
     wrapped = _ASTWrapper(model)
+    wrapped.eval()
 
     # ── Build dummy input from the real feature extractor ────────────────────
     # Run a silent clip through ASTFeatureExtractor so the dummy tensor has
@@ -117,14 +118,12 @@ def export_to_onnx(model_dir: str, output_dir: str) -> str:
             input_names=["input_values"],
             output_names=["logits"],
             dynamic_axes={
-                "input_values": {
-                    0: "batch_size"
-                },
-                "logits": {
-                    0: "batch_size"
-                },
+                "input_values": {0: "batch_size"},
+                "logits": {0: "batch_size"},
             },
             opset_version=OPSET_VERSION,
+            dynamo=False,  # legacy TorchScript exporter: honours dynamic_axes
+                           # and emits shape-inference-valid ONNX required by ORT
         )
 
     # Copy feature-extractor config alongside the model so the output

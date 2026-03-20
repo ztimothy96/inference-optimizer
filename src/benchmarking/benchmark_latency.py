@@ -32,6 +32,7 @@ CLI flags
   --n-warmup     Warm-up passes before timing      (default: 10)
   --output       JSON results path                 (default: results/latency_<model>.json)
   --no-profiler  Skip the torch.profiler run
+  --compile      Wrap model with torch.compile(mode='reduce-overhead') after loading
 """
 
 import argparse
