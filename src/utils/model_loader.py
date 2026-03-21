@@ -39,6 +39,7 @@ stable and well-tested.
 
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Union
@@ -186,9 +187,21 @@ def load_model(
         else:
             providers = ["CPUExecutionProvider"]
 
+        # Set ORT session options for optimal performance.
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+        sess_options.intra_op_num_threads = os.cpu_count() or 1
+        sess_options.inter_op_num_threads = 1
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_cpu_mem_arena = True
+
         print(f"Loading ONNX model from '{onnx_path}' …")
         print(f"  ORT providers : {providers}")
-        session = ort.InferenceSession(onnx_path, providers=providers)
+        print(f"  intra_op_threads : {sess_options.intra_op_num_threads}")
+        session = ort.InferenceSession(onnx_path,
+                                       sess_options=sess_options,
+                                       providers=providers)
         return OnnxModelWrapper(session)
 
     elif _is_quanto_dir(model_dir):
