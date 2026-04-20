@@ -102,6 +102,7 @@ def run_benchmark(
     run_profiler: bool,
     compile_model: bool = False,
     device_override: Optional[str] = None,
+    tensorrt: bool = False,
 ) -> dict:
     # ── Device ────────────────────────────────────────────────────────────────
     if device_override:
@@ -116,7 +117,7 @@ def run_benchmark(
 
     # ── Model ─────────────────────────────────────────────────────────────────
     _onnx = is_onnx_dir(model_dir)
-    model = load_model(model_dir, device)
+    model = load_model(model_dir, device, tensorrt=tensorrt)
 
     # torch.compile is only applicable to PyTorch nn.Module, not ORT sessions.
     compile_applied = False
@@ -201,10 +202,9 @@ def run_benchmark(
             t_preprocess.append((t3 - t2) * 1_000)
 
             # ── Stage 3 : Model inference (batch size = 1) ─────────────────
-            input_tensor = processed["input_values"].unsqueeze(0).to(device)
-            _sync(device)
+            input_tensor = processed["input_values"].unsqueeze(0)
             t4 = time.perf_counter()
-            _ = model(input_tensor)
+            _ = model(input_tensor.to(device))
             _sync(device)
             t5 = time.perf_counter()
             t_infer.append((t5 - t4) * 1_000)
@@ -332,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n-requests",
         type=int,
-        default=100,
+        default=400,
         help="Number of timed single-request inferences",
     )
     parser.add_argument(
@@ -363,6 +363,11 @@ if __name__ == "__main__":
         help=("Force a specific device (e.g. 'cpu', 'cuda', 'mps'). "
               "Defaults to auto-detection: mps > cuda > cpu."),
     )
+    parser.add_argument(
+        "--tensorrt",
+        action="store_true",
+        help="Use TensorRT backend",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -373,4 +378,5 @@ if __name__ == "__main__":
         run_profiler=not args.no_profiler,
         compile_model=args.compile,
         device_override=args.device,
+        tensorrt=args.tensorrt,
     )

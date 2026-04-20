@@ -1,178 +1,205 @@
 #!/usr/bin/env bash
 # upload_benchmark.sh
 #
-# Uploads the repository source and the assets needed to run
-# benchmark_latency.py on a remote ARM instance.
+# Upload repository source and benchmark assets to a Runpod SSH instance,
+# then optionally run setup_remote.sh on the pod.
 #
-# What gets uploaded
-# ------------------
-#   src/               Python package
-#   pyproject.toml     Package metadata and dependencies (pip install -e .)
-#   setup_remote.sh    One-time environment setup script for the remote
-#   data/meta/esc50.csv                  Dataset index
-#   data/audio/<fold-5 files only>       400 clips, ~168 MiB
-#   models/benchmark_model/              The requested model (no checkpoints)
+# Usage:
+#   ./upload_benchmark.sh --model-dir models/ast_baseline \
+#       --host root@<ip-address> --key ~/.ssh/<key-name> --port <port>
 #
-# The model is always written to the same fixed path on the remote
-# (models/benchmark_model/) so successive runs overwrite it, keeping
-# disk/memory usage low.
+# What is uploaded
+# ----------------
+#   src/                          → project source
+#   pyproject.toml                → build config
+#   setup_remote.sh               → one-time environment setup
+#   data/meta/esc50.csv           → label metadata
+#   data/audio/5-*.wav            → all fold-5 validation audio clips
+#   <model-dir>/                  → always written to models/benchmark_model/
+#                                   (checkpoint-* subdirs are excluded)
 #
-# Usage
-# -----
-#   ./upload_benchmark.sh --model-dir models/ast_baseline --host ec2-user@1.2.3.4
-#   ./upload_benchmark.sh --model-dir models/ast_baseline_onnx \
-#       --host ec2-user@1.2.3.4 --key ~/.ssh/my-key.pem --port 22
+# Required flags
+# --------------
+#   --model-dir   Local path to the model directory to benchmark
+#   --host        SSH destination, i.e. root@<ip-address>
+#   --key         SSH private key path
+#   --port        SSH port
 #
-# After uploading (first time only — sets up Python 3.12 venv + deps):
-#   ssh ec2-user@<IP>
-#   cd ~/inference-optimizer
-#   bash setup_remote.sh
-#
-# To benchmark (every run):
-#   source .venv/bin/activate
-#   python -m src.benchmarking.benchmark_latency \
-#       --model-dir models/benchmark_model --device cpu --no-profiler
-#
-# Requirements (local machine)
-# ----------------------------
-#   rsync, ssh, python3
+# Optional flags
+# --------------
+#   --remote-dir  Remote working dir      (default: /root/inference-optimizer)
+#   --setup       Run setup_remote.sh on the pod after uploading
 
 set -euo pipefail
 
-# ── Defaults ──────────────────────────────────────────────────────────────────
-REMOTE_BASE="~/inference-optimizer"
-REMOTE_MODEL_DIR="models/benchmark_model"
-SSH_PORT=22
-SSH_KEY=""
-DATA_ROOT="data"
-ESC50_FOLD=5
-
-# ── Argument parsing ──────────────────────────────────────────────────────────
-usage() {
-    echo "Usage: $0 --model-dir <path> --host <user@host> [--key <pem>] [--port <n>] [--remote-dir <path>]"
-    echo ""
-    echo "  --model-dir    Local path to the model directory to upload (required)"
-    echo "  --host         SSH destination, e.g. ubuntu@1.2.3.4             (required)"
-    echo "  --key          Path to SSH private key, e.g. ~/.ssh/my-key.pem  (optional)"
-    echo "  --port         SSH port                                          (default: 22)"
-    echo "  --remote-dir   Base directory on the remote host                 (default: ~/inference-optimizer)"
-    exit 1
-}
+# ── Initial values ────────────────────────────────────────────────────────────
 
 MODEL_DIR=""
-SSH_HOST=""
+HOST=""
+SSH_KEY=""
+PORT=""
+REMOTE_DIR="/root/inference-optimizer"
+RUN_SETUP=false
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+info()  { echo "[upload] $*"; }
+ok()    { echo "[upload] OK: $*"; }
+die()   { echo "[upload] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    grep '^#' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+[[ $# -eq 0 ]] && usage
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model-dir)  MODEL_DIR="$2";    shift 2 ;;
-        --host)       SSH_HOST="$2";     shift 2 ;;
-        --key)        SSH_KEY="$2";      shift 2 ;;
-        --port)       SSH_PORT="$2";     shift 2 ;;
-        --remote-dir) REMOTE_BASE="$2";  shift 2 ;;
+        --model-dir)  MODEL_DIR="$2";  shift 2 ;;
+        --host)       HOST="$2";       shift 2 ;;
+        --key)        SSH_KEY="$2";    shift 2 ;;
+        --port)       PORT="$2";       shift 2 ;;
+        --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
+        --setup)      RUN_SETUP=true;  shift   ;;
         -h|--help)    usage ;;
-        *) echo "Unknown argument: $1"; usage ;;
+        *) die "Unknown flag: $1" ;;
     esac
 done
 
-[[ -z "$MODEL_DIR" ]] && { echo "Error: --model-dir is required."; usage; }
-[[ -z "$SSH_HOST"  ]] && { echo "Error: --host is required.";      usage; }
-[[ ! -d "$MODEL_DIR" ]] && { echo "Error: model directory '$MODEL_DIR' not found."; exit 1; }
+# ── Validation ────────────────────────────────────────────────────────────────
 
-# ── SSH / rsync helpers ───────────────────────────────────────────────────────
-SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no"
-[[ -n "$SSH_KEY" ]] && SSH_OPTS="$SSH_OPTS -i $SSH_KEY"
-RSYNC_SSH="ssh $SSH_OPTS"
+[[ -z "$MODEL_DIR" ]] && die "--model-dir is required"
+[[ -z "$HOST" ]]      && die "--host is required"
+[[ -z "$SSH_KEY" ]]   && die "--key is required"
+[[ -z "$PORT" ]]      && die "--port is required"
+[[ -d "$MODEL_DIR" ]] || die "Model directory not found: $MODEL_DIR"
+[[ -f "$SSH_KEY" ]]   || die "SSH key not found: $SSH_KEY"
+[[ -d "src" ]]        || die "Run this script from the project root (src/ not found)"
 
-rsync_upload() {
-    # rsync_upload <extra rsync flags…> <local> <remote-path>
-    rsync -avz --progress -e "$RSYNC_SSH" "$@"
+AUDIO_DIR="data/audio"
+META_CSV="data/meta/esc50.csv"
+[[ -d "$AUDIO_DIR" ]]  || die "Audio directory not found: $AUDIO_DIR"
+[[ -f "$META_CSV" ]]   || die "Metadata CSV not found: $META_CSV"
+
+# ── SSH helpers ───────────────────────────────────────────────────────────────
+# Transfer method: tar | ssh "tar xf - -C dest"
+
+SSH_OPTS=(-i "$SSH_KEY" -p "$PORT"
+          -o StrictHostKeyChecking=no
+          -o BatchMode=yes
+          -T)           # -T: no PTY; the gateway banner appears on stdout but
+                        #     does not affect the stdin pipe we use for uploads.
+
+remote_exec() {
+    ssh "${SSH_OPTS[@]}" "$HOST" "$*"
 }
 
-remote_run() {
-    # remote_run <command>  — run a command on the remote host
-    ssh $SSH_OPTS "$SSH_HOST" "$@"
+# tar_up <remote-extract-dir> <local-path>…
+#   Creates a gzip'd tar archive of the listed local paths and extracts it on
+#   the remote under <remote-extract-dir> (relative to REMOTE_DIR).
+tar_up() {
+    local dest="$1"; shift
+    tar czf - "$@" \
+        | ssh "${SSH_OPTS[@]}" "$HOST" \
+              "tar xzf - -C '${REMOTE_DIR}/${dest}'"
 }
 
-# ── 1. Create remote directory layout ─────────────────────────────────────────
-echo ""
-echo "==> [1/4] Creating remote directory structure …"
-remote_run "mkdir -p $REMOTE_BASE/models $REMOTE_BASE/data/audio $REMOTE_BASE/data/meta"
+# ── 0. Ensure remote directory exists ─────────────────────────────────────────
 
-# ── 2. Upload source code and config files ────────────────────────────────────
-echo ""
-echo "==> [2/4] Uploading source code …"
-rsync_upload \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='.venv' \
-    --exclude='*.egg-info' \
-    --filter=':- .gitignore' \
-    src \
-    pyproject.toml \
-    setup_remote.sh \
-    "$SSH_HOST:$REMOTE_BASE/"
+info "==> [0/4] Preparing remote directory …"
+remote_exec "mkdir -p '${REMOTE_DIR}/src' \
+                       '${REMOTE_DIR}/data/meta' \
+                       '${REMOTE_DIR}/data/audio' \
+                       '${REMOTE_DIR}/models/benchmark_model'"
+ok "Remote directory layout ready"
 
-# ── 3. Upload the model (no checkpoints) ──────────────────────────────────────
-echo ""
-echo "==> [3/4] Uploading model '$(basename "$MODEL_DIR")' → remote '$REMOTE_MODEL_DIR' …"
-echo "    (Checkpoint subdirectories are excluded to save disk space)"
+# ── 1. Source tree ────────────────────────────────────────────────────────────
 
-# Delete the remote model dir first so stale files from a previous model don't linger.
-remote_run "rm -rf $REMOTE_BASE/$REMOTE_MODEL_DIR && mkdir -p $REMOTE_BASE/$REMOTE_MODEL_DIR"
+info "==> [1/4] Uploading source tree …"
+# Paths in the archive are src/…, pyproject.toml, setup_remote.sh; they land
+# correctly when extracted relative to REMOTE_DIR.
+tar_up "." src/ pyproject.toml setup_remote.sh
+ok "Source tree uploaded"
 
-rsync_upload \
-    --exclude='checkpoint-*' \
-    "$MODEL_DIR/" \
-    "$SSH_HOST:$REMOTE_BASE/$REMOTE_MODEL_DIR/"
+# ── 2. Data assets ────────────────────────────────────────────────────────────
 
-# ── 4. Upload ESC-50 data (fold 5 only) ───────────────────────────────────────
-echo ""
-echo "==> [4/4] Uploading ESC-50 fold $ESC50_FOLD audio clips and metadata …"
+info "==> [2/4] Uploading data assets …"
 
-CSV_PATH="$DATA_ROOT/meta/esc50.csv"
-[[ ! -f "$CSV_PATH" ]] && { echo "Error: '$CSV_PATH' not found. Is \$DATA_ROOT set correctly?"; exit 1; }
+# Metadata CSV (archive path is data/meta/esc50.csv → extracted under REMOTE_DIR)
+tar_up "." "$META_CSV"
+ok "Metadata CSV uploaded"
 
-# Build a temp file-list of fold-5 filenames for rsync --files-from.
-TMPFILE="$(mktemp /tmp/esc50_fold5_XXXXXX.txt)"
-trap 'rm -f "$TMPFILE"' EXIT
+# Select all fold-5 audio files (ESC-50 filenames start with "{fold}-").
+# Use a while-read loop instead of mapfile for bash 3.2 compatibility (macOS).
+AUDIO_FILES=()
+while IFS= read -r f; do
+    AUDIO_FILES+=("$f")
+done < <(find "$AUDIO_DIR" -maxdepth 1 -type f -name "5-*.wav" | sort)
 
-python3 - <<'PYEOF' > "$TMPFILE"
-import csv, sys, os
+if [[ ${#AUDIO_FILES[@]} -eq 0 ]]; then
+    die "No fold-5 .wav files found in $AUDIO_DIR (expected filenames like 5-*.wav)"
+fi
 
-data_root = os.environ.get("DATA_ROOT", "data")
-fold      = int(os.environ.get("ESC50_FOLD", "5"))
-csv_path  = os.path.join(data_root, "meta", "esc50.csv")
+info "Uploading ${#AUDIO_FILES[@]} audio clip(s) …"
+# Archive paths are data/audio/…; extracted under REMOTE_DIR.
+tar_up "." "${AUDIO_FILES[@]}"
+ok "${#AUDIO_FILES[@]} audio clip(s) uploaded"
 
-with open(csv_path, newline="", encoding="utf-8") as fh:
-    for row in csv.DictReader(fh):
-        if int(row["fold"]) == fold:
-            print(row["filename"])
-PYEOF
+# ── 3. Model (always written to models/benchmark_model/) ─────────────────────
 
-N_CLIPS="$(wc -l < "$TMPFILE" | tr -d ' ')"
-echo "    Found $N_CLIPS clips in fold $ESC50_FOLD."
+info "==> [3/4] Uploading model → models/benchmark_model/ …"
+# Wipe and recreate the destination so switching models never leaves stale
+# weights behind (mirrors the semantics of rsync --delete).
+remote_exec "rm -rf '${REMOTE_DIR}/models/benchmark_model' && \
+             mkdir -p '${REMOTE_DIR}/models/benchmark_model'"
 
-# Upload metadata CSV
-rsync_upload \
-    "$DATA_ROOT/meta/esc50.csv" \
-    "$SSH_HOST:$REMOTE_BASE/data/meta/esc50.csv"
+# Archive the model contents with -C so archive paths are ./config.json etc.,
+# extracted directly into benchmark_model/ with no extra nesting.
+# No compression (tar cf, not czf): model weights are dense binary blobs that
+# compress negligibly, so gzip only wastes CPU time on both ends.
+# Exclude checkpoint-* subdirectories: they contain duplicate weights plus
+# optimizer states (~433 MB each) that are irrelevant for inference.
 
-# Upload only fold-5 audio files (--files-from paths are relative to $DATA_ROOT/audio/)
-rsync_upload \
-    --files-from="$TMPFILE" \
-    "$DATA_ROOT/audio/" \
-    "$SSH_HOST:$REMOTE_BASE/data/audio/"
+# Compute bytes to be transferred (mirrors the tar --exclude above) so pv can
+# show a meaningful percentage and ETA.  stat -f%z is macOS; falls back to 0
+# (no ETA) on systems where it is unavailable.
+UPLOAD_BYTES=$(find "$MODEL_DIR" -not -path "*/checkpoint-*" -type f \
+               -exec stat -f%z {} \; 2>/dev/null | awk '{s+=$1} END {print s+0}')
+
+if command -v pv &>/dev/null; then
+    tar cf - -C "$MODEL_DIR" --exclude='./checkpoint-*' . \
+        | pv -s "$UPLOAD_BYTES" -N "  model" \
+        | ssh "${SSH_OPTS[@]}" "$HOST" \
+              "tar xf - -C '${REMOTE_DIR}/models/benchmark_model'"
+else
+    info "  (tip: brew install pv to get a live progress bar)"
+    tar cf - -C "$MODEL_DIR" --exclude='./checkpoint-*' . \
+        | ssh "${SSH_OPTS[@]}" "$HOST" \
+              "tar xf - -C '${REMOTE_DIR}/models/benchmark_model'"
+fi
+ok "Model uploaded ($(du -sh "$MODEL_DIR" | cut -f1) total local size, checkpoints excluded)"
+
+# ── 4. Optional: run setup on the pod ────────────────────────────────────────
+
+if $RUN_SETUP; then
+    info "==> [4/4] Running setup_remote.sh on pod …"
+    remote_exec "cd '${REMOTE_DIR}' && bash setup_remote.sh"
+    ok "Remote setup complete"
+else
+    info "==> [4/4] Skipping remote setup (pass --setup to run setup_remote.sh)"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
-echo "====================================================================="
-echo "Upload complete."
+echo "================================================================"
+echo "Upload complete. To benchmark on the pod:"
 echo ""
-echo "On the remote, run:"
-echo "  ssh $SSH_OPTS $SSH_HOST"
-echo "  cd $REMOTE_BASE"
-echo "  bash setup_remote.sh          # first time only"
+echo "  ssh -i $SSH_KEY -p $PORT $HOST"
+echo "  cd $REMOTE_DIR"
 echo "  source .venv/bin/activate"
 echo "  python -m src.benchmarking.benchmark_latency \\"
-echo "      --model-dir $REMOTE_MODEL_DIR --device cpu --no-profiler"
-echo "====================================================================="
+echo "      --model-dir models/benchmark_model --device cuda"
+echo "================================================================"

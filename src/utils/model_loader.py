@@ -140,6 +140,7 @@ class OnnxModelWrapper:
 def load_model(
     model_dir: str,
     device: torch.device,
+    tensorrt: bool = False,
 ) -> Union[torch.nn.Module, OnnxModelWrapper]:
     """
     Load a model from *model_dir*, auto-detecting PyTorch vs ONNX format.
@@ -182,8 +183,23 @@ def load_model(
         # MPS falls through to CPU: ORT has no MPS EP, and CoreML EP has an
         # unfixed crash on macOS arm64 (see module docstring).
         available = ort.get_available_providers()
-        if device.type == "cuda" and "CUDAExecutionProvider" in available:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if device.type == "cuda":
+            if tensorrt and "TensorrtExecutionProvider" in available:
+                trt_options = {
+                    "trt_max_workspace_size": 2 << 30,  # 2 GB
+                    "trt_fp16_enable": True,
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path":
+                    str(Path(model_dir) / "trt_cache"),
+                    "trt_detailed_build_log": True,
+                }
+                providers = [
+                    ("TensorrtExecutionProvider", trt_options),
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ]
+            elif "CUDAExecutionProvider" in available:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         else:
             providers = ["CPUExecutionProvider"]
 

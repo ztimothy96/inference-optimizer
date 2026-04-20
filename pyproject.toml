@@ -7,14 +7,15 @@ name = "inference-optimizer"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.10.0",
-    "torchaudio>=2.10.0",
+    # torch and torchaudio are intentionally omitted here.
+    # They must be installed from the PyTorch index (not PyPI) to get the
+    # correct CUDA build. setup_remote.sh handles this via get_torch_index_url().
     "transformers>=5.2.0",
     "accelerate>=1.12.0",
     "numpy>=2.4.0",
     "scikit-learn>=1.8.0",
     "tqdm>=4.67.0",
-    "onnxruntime>=1.24.0",
+    "onnxruntime>=1.24.0",  # CPU-only; setup_remote.sh upgrades to onnxruntime-gpu on CUDA hosts
     "onnxscript>=0.6.2",
     "optimum-quanto>=0.2.7",
     "soundfile>=0.12.0",
