@@ -170,7 +170,7 @@ if command -v nvidia-smi &>/dev/null; then
     # `source .venv/bin/activate` always exposes libnvinfer.so.10 to ORT.
     # We write a guard comment so the block is only appended once.
     ACTIVATE_SCRIPT="$VENV_DIR/bin/activate"
-    if ! grep -q "# [tensorrt LD_LIBRARY_PATH]" "$ACTIVATE_SCRIPT"; then
+    if ! grep -qF "# [tensorrt LD_LIBRARY_PATH]" "$ACTIVATE_SCRIPT"; then
         info "Patching $ACTIVATE_SCRIPT with TensorRT LD_LIBRARY_PATH …"
         cat >> "$ACTIVATE_SCRIPT" << 'EOF'
 
